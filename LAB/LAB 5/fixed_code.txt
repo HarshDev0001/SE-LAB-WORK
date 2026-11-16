@@ -1,0 +1,229 @@
+"""Warehouse stock management with safer input and file handling."""
+
+import ast
+import hashlib
+import json
+import math
+import operator
+import os
+from datetime import datetime
+
+
+warehouse_stock = {}
+
+AUDIT_FILE = "warehouse_audit.log"
+SUPERVISOR_PASSWORD_ENV = os.environ.get(
+    "WH_PASSWORD_VARIABLE_NAME",
+    "SUPERVISOR_CREDENTIAL"
+)
+
+_ALLOWED_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+
+
+def add_stock(sku, qty=0, history=None):
+    """Add stock for a valid SKU."""
+    if history is None:
+        history = []
+
+    if not isinstance(sku, str) or not sku.strip():
+        raise ValueError("SKU must be a non-empty string.")
+
+    if not isinstance(qty, int) or isinstance(qty, bool) or qty < 0:
+        raise ValueError("Quantity must be a non-negative integer.")
+
+    warehouse_stock[sku] = warehouse_stock.get(sku, 0) + qty
+    history.append(
+        f"{datetime.now().isoformat()}: Received {qty} units of {sku}"
+    )
+
+
+def remove_stock(sku, qty):
+    """Remove stock without allowing negative inventory."""
+    if sku not in warehouse_stock:
+        raise KeyError(f"Unknown SKU: {sku}")
+
+    if not isinstance(qty, int) or isinstance(qty, bool) or qty < 0:
+        raise ValueError("Quantity must be a non-negative integer.")
+
+    if qty > warehouse_stock[sku]:
+        raise ValueError("Insufficient stock.")
+
+    warehouse_stock[sku] -= qty
+
+    if warehouse_stock[sku] == 0:
+        del warehouse_stock[sku]
+
+
+def get_stock(sku):
+    """Return the available quantity for a SKU."""
+    return warehouse_stock.get(sku, 0)
+
+
+def sku_checksum(sku):
+    """Return a short SHA-256 fingerprint for a SKU."""
+    return hashlib.sha256(sku.encode("utf-8")).hexdigest()[:6]
+
+
+def load_stock(file="warehouse.json"):
+    """Load and validate inventory from a JSON file."""
+    with open(file, "r", encoding="utf-8") as stock_file:
+        data = json.load(stock_file)
+
+    if not isinstance(data, dict):
+        raise ValueError("Inventory data must be a JSON object.")
+
+    for sku, qty in data.items():
+        if (
+            not isinstance(sku, str)
+            or not sku.strip()
+            or not isinstance(qty, int)
+            or isinstance(qty, bool)
+            or qty < 0
+        ):
+            raise ValueError("Invalid SKU or stock quantity in JSON.")
+
+    warehouse_stock.clear()
+    warehouse_stock.update(data)
+
+
+def save_stock(file="warehouse.json"):
+    """Save inventory to a JSON file."""
+    with open(file, "w", encoding="utf-8") as stock_file:
+        json.dump(warehouse_stock, stock_file, indent=4)
+
+
+def print_report():
+    """Print the current warehouse stock report."""
+    print("Warehouse Stock Report")
+
+    for sku, quantity in sorted(warehouse_stock.items()):
+        print(
+            f"{sku} -> {quantity} units "
+            f"[chk: {sku_checksum(sku)}]"
+        )
+
+
+def check_reorder(threshold=10):
+    """Return SKUs whose stock is below the threshold."""
+    return [
+        sku
+        for sku, quantity in warehouse_stock.items()
+        if quantity < threshold
+    ]
+
+
+def _evaluate_node(node, current):
+    """Evaluate an explicitly permitted arithmetic expression."""
+    if isinstance(node, ast.Expression):
+        return _evaluate_node(node.body, current)
+
+    if isinstance(node, ast.Name) and node.id == "current":
+        return current
+
+    if (
+        isinstance(node, ast.Constant)
+        and type(node.value) in (int, float)
+    ):
+        return node.value
+
+    if isinstance(node, ast.BinOp):
+        operation = _ALLOWED_OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Unsupported arithmetic operator.")
+
+        left = _evaluate_node(node.left, current)
+        right = _evaluate_node(node.right, current)
+
+        return operation(left, right)
+
+    raise ValueError("Unsupported expression.")
+
+
+def evaluate_formula(formula, current):
+    """Safely evaluate a restricted stock adjustment formula."""
+    if not isinstance(formula, str) or len(formula) > 100:
+        raise ValueError("Invalid formula.")
+
+    tree = ast.parse(formula, mode="eval")
+    result = _evaluate_node(tree, current)
+
+    if (
+        not isinstance(result, (int, float))
+        or isinstance(result, bool)
+        or not math.isfinite(result)
+        or result < 0
+        or result != int(result)
+    ):
+        raise ValueError(
+            "Formula must produce a non-negative integer."
+        )
+
+    return int(result)
+
+
+def apply_adjustment(sku, formula, password):
+    """Authorize, apply, and audit a stock adjustment."""
+    expected_password = os.environ.get(SUPERVISOR_PASSWORD_ENV)
+
+    if not expected_password or password != expected_password:
+        raise PermissionError("Invalid supervisor credentials.")
+
+    if not isinstance(sku, str) or not sku.strip():
+        raise ValueError("SKU must be a non-empty string.")
+
+    current = get_stock(sku)
+    adjusted = evaluate_formula(formula, current)
+
+    warehouse_stock[sku] = adjusted
+
+    with open(AUDIT_FILE, "a", encoding="utf-8") as audit_file:
+        audit_file.write(
+            f"Adjusted {sku} from {current} to {adjusted} "
+            f"at {datetime.now().isoformat()}\n"
+        )
+
+
+def main():
+    """Run the warehouse stock management demonstration."""
+    add_stock("WID-001", 40)
+    add_stock("WID-002", 4)
+
+    try:
+        add_stock(404, 15)
+    except ValueError:
+        print("Invalid SKU rejected.")
+
+    remove_stock("WID-001", 12)
+
+    print("WID-002 stock:", get_stock("WID-002"))
+    print("Needs reorder:", check_reorder())
+
+    password = os.environ.get(SUPERVISOR_PASSWORD_ENV, "")
+
+    try:
+        apply_adjustment("WID-002", "current + 25", password)
+    except (
+        ValueError,
+        PermissionError,
+        SyntaxError,
+        ZeroDivisionError,
+        OverflowError,
+    ):
+        print("Stock adjustment rejected.")
+
+    save_stock()
+    load_stock()
+    print_report()
+    print("Stock audit complete.")
+
+
+if __name__ == "__main__":
+    main()
